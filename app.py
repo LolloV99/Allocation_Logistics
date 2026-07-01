@@ -38,7 +38,7 @@ CHARGE_CATEGORY_RULES = {
 # 2. PROCESSING PIPELINE HELPER FUNCTIONS
 # ==============================================================================
 def parse_net_amount(series, num_format):
-    """Normalizes localized numeric string types into clean floats."""
+    """Normalizes localized numeric string types into clean floats safely."""
     clean_series = series.astype(str).str.strip()
     if num_format == "german":
         clean_series = clean_series.str.replace('.', '', regex=False)
@@ -64,37 +64,34 @@ def normalize_invoice(carrier_code, uploaded_files):
     for uploaded_file in uploaded_files:
         header_setting = 0 if config["has_header"] else None
         
-        # Read with the appropriate engine based on file type
         if uploaded_file.name.endswith(('.xlsx', '.xls')):
-            df_raw = pd.read_excel(
-                uploaded_file,
-                header=header_setting,
-                dtype=str
-            )
+            df_raw = pd.read_excel(uploaded_file, header=header_setting, dtype=str)
         else:
-            df_raw = pd.read_csv(
-                uploaded_file, 
-                header=header_setting, 
-                encoding=config["encoding"], 
-                delimiter=config["delimiter"],
-                dtype=str
-            )
+            df_raw = pd.read_csv(uploaded_file, header=header_setting, encoding=config["encoding"], delimiter=config["delimiter"], dtype=str)
+        
+        # FIX 1: Strip invisible accidental trailing/leading spaces from input headers
+        df_raw.columns = df_raw.columns.astype(str).str.strip()
         
         df_canonical = pd.DataFrame()
         
         # Extract mapped source columns
         for canonical_field, source_field in f_map.items():
+            # Strip target key string as well to ensure clean matching mechanics
+            s_field_clean = str(source_field).strip()
             if config["has_header"]:
-                df_canonical[canonical_field] = df_raw[source_field]
+                df_canonical[canonical_field] = df_raw[s_field_clean]
             else:
-                df_canonical[canonical_field] = df_raw.iloc[:, int(source_field)]
+                df_canonical[canonical_field] = df_raw.iloc[:, int(s_field_clean)]
                 
         # Inject constants if applicable
         for const_field, const_val in consts.items():
             df_canonical[const_field] = const_val
             
-        # Standardize calculations and categories
+        # Standardize calculations and string types to secure aggregation groups
         df_canonical["amount_net"] = parse_net_amount(df_canonical["amount_net"], config["numeric_format"])
+        df_canonical["dest_country"] = df_canonical["dest_country"].astype(str).str.strip()
+        df_canonical["handover_date"] = df_canonical["handover_date"].astype(str).str.strip()
+        
         if "description" not in df_canonical.columns:
             df_canonical["description"] = "Base Freight"
             
@@ -109,12 +106,12 @@ def normalize_invoice(carrier_code, uploaded_files):
 
 def run_allocation_engine(canonical_df, df_bq):
     """Splits carrier country totals across target channels using BQ parcel shares."""
-    # Exclude tax rows from all allocation steps [cite: 23]
+    # Exclude tax rows from all allocation steps
     work_df = canonical_df[canonical_df["charge_category"] != "tax"].copy()
     
-    # Core aggregation
+    # Core aggregation (safe from dropping string 'nan' keys)
     invoice_geo = work_df.groupby(["carrier", "dest_country", "alloc_month"])["amount_net"].sum().reset_index()
-    df_bq_parcels = df_bq[df_bq["ship_type"] == "parcel"].copy() [cite: 49]
+    df_bq_parcels = df_bq[df_bq["ship_type"].astype(str).str.strip() == 'parcel'].copy()
     
     allocated_chunks = []
     
@@ -123,17 +120,17 @@ def run_allocation_engine(canonical_df, df_bq):
         bq_codes = CARRIER_REGISTRY[carrier]["bq_carrier_codes"]
         
         try:
-            year_val = int(month.split("-")[0])
-            month_val = int(month.split("-")[1])
+            year_val = int(str(month).split("-")[0])
+            month_val = int(str(month).split("-")[1])
         except Exception:
             year_val, month_val = 2026, 6
             
-        # Match against BQ extract metrics [cite: 45, 50]
+        # Match against BQ extract metrics securely by stripping text bounds
         bq_subset = df_bq_parcels[
-            (df_bq_parcels["carrier"].isin(bq_codes)) & [cite: 50]
-            (df_bq_parcels["shiptocountry"] == str(country)) & [cite: 45]
-            (df_bq_parcels["year"] == year_val) &
-            (df_bq_parcels["month"] == month_val)
+            (df_bq_parcels["carrier"].astype(str).str.strip().isin(bq_codes)) &
+            (df_bq_parcels["shiptocountry"].astype(str).str.strip() == str(country).strip()) &
+            (pd.to_numeric(df_bq_parcels["year"], errors='coerce') == year_val) &
+            (pd.to_numeric(df_bq_parcels["month"], errors='coerce') == month_val)
         ]
         
         if bq_subset.empty:
@@ -143,14 +140,14 @@ def run_allocation_engine(canonical_df, df_bq):
             }))
             continue
             
-        # Multi-channel splitting math using channel_corr column [cite: 46, 48]
-        channel_shares = bq_subset.groupby("channel_corr")["parcels"].sum().reset_index() [cite: 48]
+        # Multi-channel splitting math using channel_corr column
+        channel_shares = bq_subset.groupby("channel_corr")["parcels"].sum().reset_index()
         total_parcels = channel_shares["parcels"].sum()
         
         channel_shares["carrier"] = carrier
         channel_shares["dest_country"] = country
         channel_shares["alloc_month"] = month
-        channel_shares["amount_channel"] = net_amount * (channel_shares["parcels"] / total_parcels) [cite: 46]
+        channel_shares["amount_channel"] = net_amount * (channel_shares["parcels"] / total_parcels)
         
         allocated_chunks.append(channel_shares)
         
@@ -165,14 +162,13 @@ st.markdown("Automated logistics pipeline for transforming raw invoices into nor
 st.sidebar.header("Data Ingestion Panel")
 selected_carrier = st.sidebar.selectbox("Select Target Carrier Pipeline", list(CARRIER_REGISTRY.keys()))
 
-# Invoice file uploader (supports Excel or CSV)
+# Ingest configurations with support for both file signatures
 uploaded_invoices = st.sidebar.file_uploader(
     f"Upload raw {selected_carrier} Invoice (Excel or CSV)", 
     type=["csv", "xlsx"], 
     accept_multiple_files=True
 )
 
-# UPDATED: BigQuery file uploader now accepts both CSV and XLSX extensions
 uploaded_bq = st.sidebar.file_uploader(
     "Upload BigQuery Parcel Extract (Excel or CSV)", 
     type=["csv", "xlsx"]
@@ -187,20 +183,23 @@ if st.sidebar.button("Run Cost Allocation Matrix", type="primary"):
                 # Step 1 & 2: Load and normalize invoices
                 df_canonical = normalize_invoice(selected_carrier, uploaded_invoices)
                 
-                # UPDATED: Dynamic extension branching for BigQuery extract ingestion
+                # Dynamic extension branching for BigQuery extract ingestion
                 if uploaded_bq.name.endswith(('.xlsx', '.xls')):
                     df_bq_raw = pd.read_excel(uploaded_bq)
                 else:
                     df_bq_raw = pd.read_csv(uploaded_bq)
                 
+                # FIX 2: Strip invisible trailing/leading spaces from BigQuery input headers
+                df_bq_raw.columns = df_bq_raw.columns.astype(str).str.strip()
+                
                 # Step 3 & 4: Run allocation calculations
                 df_allocated = run_allocation_engine(df_canonical, df_bq_raw)
                 
-                # Pipeline Audit Compliance Checks [cite: 70, 71]
-                pre_split_total = df_canonical[df_canonical["charge_category"] != "tax"]["amount_net"].sum() [cite: 70]
+                # Pipeline Audit Compliance Checks
+                pre_split_total = df_canonical[df_canonical["charge_category"] != "tax"]["amount_net"].sum()
                 post_split_total = df_allocated["amount_channel"].sum() if not df_allocated.empty else 0.0
                 
-                # Check line aggregation verification [cite: 71]
+                # Check line aggregation verification
                 country_reconciliation = df_allocated.groupby("dest_country")["amount_channel"].sum().reset_index()
                 invoice_geo_totals = df_canonical[df_canonical["charge_category"] != "tax"].groupby("dest_country")["amount_net"].sum().reset_index()
                 merged_check = pd.merge(invoice_geo_totals, country_reconciliation, on="dest_country", how="left").fillna(0.0)
