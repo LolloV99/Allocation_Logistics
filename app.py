@@ -69,14 +69,20 @@ def normalize_invoice(carrier_code, uploaded_files):
         else:
             df_raw = pd.read_csv(uploaded_file, header=header_setting, encoding=config["encoding"], delimiter=config["delimiter"], dtype=str)
         
-        # FIX 1: Strip invisible accidental trailing/leading spaces from input headers
+        # Clean up input headers
         df_raw.columns = df_raw.columns.astype(str).str.strip()
+        
+        # DEFENSIVE AUDIT 1: Verify all mapped columns exist in the uploaded file
+        missing_invoice_cols = [str(col).strip() for col in f_map.values() if str(col).strip() not in df_raw.columns]
+        if missing_invoice_cols:
+            st.error(f"❌ **Invoice Layout Error:** The file `{uploaded_file.name}` is missing expected columns: `{missing_invoice_cols}`. "
+                     f"Columns found in file were: `{list(df_raw.columns)[:10]}...` (If using Excel, ensure data starts on the very first row).")
+            st.stop()
         
         df_canonical = pd.DataFrame()
         
         # Extract mapped source columns
         for canonical_field, source_field in f_map.items():
-            # Strip target key string as well to ensure clean matching mechanics
             s_field_clean = str(source_field).strip()
             if config["has_header"]:
                 df_canonical[canonical_field] = df_raw[s_field_clean]
@@ -106,10 +112,9 @@ def normalize_invoice(carrier_code, uploaded_files):
 
 def run_allocation_engine(canonical_df, df_bq):
     """Splits carrier country totals across target channels using BQ parcel shares."""
-    # Exclude tax rows from all allocation steps
     work_df = canonical_df[canonical_df["charge_category"] != "tax"].copy()
     
-    # Core aggregation (safe from dropping string 'nan' keys)
+    # Core aggregation
     invoice_geo = work_df.groupby(["carrier", "dest_country", "alloc_month"])["amount_net"].sum().reset_index()
     df_bq_parcels = df_bq[df_bq["ship_type"].astype(str).str.strip() == 'parcel'].copy()
     
@@ -125,7 +130,7 @@ def run_allocation_engine(canonical_df, df_bq):
         except Exception:
             year_val, month_val = 2026, 6
             
-        # Match against BQ extract metrics securely by stripping text bounds
+        # Match against BQ extract metrics securely
         bq_subset = df_bq_parcels[
             (df_bq_parcels["carrier"].astype(str).str.strip().isin(bq_codes)) &
             (df_bq_parcels["shiptocountry"].astype(str).str.strip() == str(country).strip()) &
@@ -140,7 +145,6 @@ def run_allocation_engine(canonical_df, df_bq):
             }))
             continue
             
-        # Multi-channel splitting math using channel_corr column
         channel_shares = bq_subset.groupby("channel_corr")["parcels"].sum().reset_index()
         total_parcels = channel_shares["parcels"].sum()
         
@@ -162,7 +166,6 @@ st.markdown("Automated logistics pipeline for transforming raw invoices into nor
 st.sidebar.header("Data Ingestion Panel")
 selected_carrier = st.sidebar.selectbox("Select Target Carrier Pipeline", list(CARRIER_REGISTRY.keys()))
 
-# Ingest configurations with support for both file signatures
 uploaded_invoices = st.sidebar.file_uploader(
     f"Upload raw {selected_carrier} Invoice (Excel or CSV)", 
     type=["csv", "xlsx"], 
@@ -189,17 +192,24 @@ if st.sidebar.button("Run Cost Allocation Matrix", type="primary"):
                 else:
                     df_bq_raw = pd.read_csv(uploaded_bq)
                 
-                # FIX 2: Strip invisible trailing/leading spaces from BigQuery input headers
+                # Clean up BigQuery input headers
                 df_bq_raw.columns = df_bq_raw.columns.astype(str).str.strip()
+                
+                # DEFENSIVE AUDIT 2: Verify BigQuery columns match engine rules
+                required_bq_cols = ["ship_type", "carrier", "shiptocountry", "year", "month", "channel_corr", "parcels"]
+                missing_bq_cols = [col for col in required_bq_cols if col not in df_bq_raw.columns]
+                if missing_bq_cols:
+                    st.error(f"❌ **BigQuery Extract Layout Error:** The file `{uploaded_bq.name}` is missing required tracking columns: `{missing_bq_cols}`. "
+                             f"Columns found were: `{list(df_bq_raw.columns)}`.")
+                    st.stop()
                 
                 # Step 3 & 4: Run allocation calculations
                 df_allocated = run_allocation_engine(df_canonical, df_bq_raw)
                 
                 # Pipeline Audit Compliance Checks
-                pre_split_total = df_canonical[df_canonical["charge_category"] != "tax"]["amount_net"].sum()
+                pre_split_total = df_canonical[df_canonical["charge_category"] != "tax"].["amount_net"].sum()
                 post_split_total = df_allocated["amount_channel"].sum() if not df_allocated.empty else 0.0
                 
-                # Check line aggregation verification
                 country_reconciliation = df_allocated.groupby("dest_country")["amount_channel"].sum().reset_index()
                 invoice_geo_totals = df_canonical[df_canonical["charge_category"] != "tax"].groupby("dest_country")["amount_net"].sum().reset_index()
                 merged_check = pd.merge(invoice_geo_totals, country_reconciliation, on="dest_country", how="left").fillna(0.0)
