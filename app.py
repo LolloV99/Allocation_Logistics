@@ -64,7 +64,6 @@ def normalize_invoice(carrier_code, uploaded_files):
     for uploaded_file in uploaded_files:
         header_setting = 0 if config["has_header"] else None
         
-        # DYNAMIC EXTENSION DETECTION
         # Read with the appropriate engine based on file type
         if uploaded_file.name.endswith(('.xlsx', '.xls')):
             df_raw = pd.read_excel(
@@ -110,12 +109,12 @@ def normalize_invoice(carrier_code, uploaded_files):
 
 def run_allocation_engine(canonical_df, df_bq):
     """Splits carrier country totals across target channels using BQ parcel shares."""
-    # Exclude tax rows from all allocation steps
+    # Exclude tax rows from all allocation steps [cite: 23]
     work_df = canonical_df[canonical_df["charge_category"] != "tax"].copy()
     
     # Core aggregation
     invoice_geo = work_df.groupby(["carrier", "dest_country", "alloc_month"])["amount_net"].sum().reset_index()
-    df_bq_parcels = df_bq[df_bq["ship_type"] == "parcel"].copy()
+    df_bq_parcels = df_bq[df_bq["ship_type"] == "parcel"].copy() [cite: 49]
     
     allocated_chunks = []
     
@@ -129,10 +128,10 @@ def run_allocation_engine(canonical_df, df_bq):
         except Exception:
             year_val, month_val = 2026, 6
             
-        # Match against BQ extract metrics
+        # Match against BQ extract metrics [cite: 45, 50]
         bq_subset = df_bq_parcels[
-            (df_bq_parcels["carrier"].isin(bq_codes)) &
-            (df_bq_parcels["shiptocountry"] == str(country)) &
+            (df_bq_parcels["carrier"].isin(bq_codes)) & [cite: 50]
+            (df_bq_parcels["shiptocountry"] == str(country)) & [cite: 45]
             (df_bq_parcels["year"] == year_val) &
             (df_bq_parcels["month"] == month_val)
         ]
@@ -144,14 +143,14 @@ def run_allocation_engine(canonical_df, df_bq):
             }))
             continue
             
-        # Multi-channel splitting math
-        channel_shares = bq_subset.groupby("channel_corr")["parcels"].sum().reset_index()
+        # Multi-channel splitting math using channel_corr column [cite: 46, 48]
+        channel_shares = bq_subset.groupby("channel_corr")["parcels"].sum().reset_index() [cite: 48]
         total_parcels = channel_shares["parcels"].sum()
         
         channel_shares["carrier"] = carrier
         channel_shares["dest_country"] = country
         channel_shares["alloc_month"] = month
-        channel_shares["amount_channel"] = net_amount * (channel_shares["parcels"] / total_parcels)
+        channel_shares["amount_channel"] = net_amount * (channel_shares["parcels"] / total_parcels) [cite: 46]
         
         allocated_chunks.append(channel_shares)
         
@@ -166,13 +165,18 @@ st.markdown("Automated logistics pipeline for transforming raw invoices into nor
 st.sidebar.header("Data Ingestion Panel")
 selected_carrier = st.sidebar.selectbox("Select Target Carrier Pipeline", list(CARRIER_REGISTRY.keys()))
 
-# Updated file uploader to support both CSV and XLSX extensions
+# Invoice file uploader (supports Excel or CSV)
 uploaded_invoices = st.sidebar.file_uploader(
     f"Upload raw {selected_carrier} Invoice (Excel or CSV)", 
     type=["csv", "xlsx"], 
     accept_multiple_files=True
 )
-uploaded_bq = st.sidebar.file_uploader("Upload BigQuery Parcel Extract CSV", type=["csv"])
+
+# UPDATED: BigQuery file uploader now accepts both CSV and XLSX extensions
+uploaded_bq = st.sidebar.file_uploader(
+    "Upload BigQuery Parcel Extract (Excel or CSV)", 
+    type=["csv", "xlsx"]
+)
 
 if st.sidebar.button("Run Cost Allocation Matrix", type="primary"):
     if not uploaded_invoices or not uploaded_bq:
@@ -180,18 +184,23 @@ if st.sidebar.button("Run Cost Allocation Matrix", type="primary"):
     else:
         with st.spinner("Executing normalization and allocation processes..."):
             try:
-                # Step 1 & 2: Load and normalize
+                # Step 1 & 2: Load and normalize invoices
                 df_canonical = normalize_invoice(selected_carrier, uploaded_invoices)
-                df_bq_raw = pd.read_csv(uploaded_bq)
+                
+                # UPDATED: Dynamic extension branching for BigQuery extract ingestion
+                if uploaded_bq.name.endswith(('.xlsx', '.xls')):
+                    df_bq_raw = pd.read_excel(uploaded_bq)
+                else:
+                    df_bq_raw = pd.read_csv(uploaded_bq)
                 
                 # Step 3 & 4: Run allocation calculations
                 df_allocated = run_allocation_engine(df_canonical, df_bq_raw)
                 
-                # Pipeline Audit Compliance Checks
-                pre_split_total = df_canonical[df_canonical["charge_category"] != "tax"]["amount_net"].sum()
+                # Pipeline Audit Compliance Checks [cite: 70, 71]
+                pre_split_total = df_canonical[df_canonical["charge_category"] != "tax"]["amount_net"].sum() [cite: 70]
                 post_split_total = df_allocated["amount_channel"].sum() if not df_allocated.empty else 0.0
                 
-                # Check line aggregation verification
+                # Check line aggregation verification [cite: 71]
                 country_reconciliation = df_allocated.groupby("dest_country")["amount_channel"].sum().reset_index()
                 invoice_geo_totals = df_canonical[df_canonical["charge_category"] != "tax"].groupby("dest_country")["amount_net"].sum().reset_index()
                 merged_check = pd.merge(invoice_geo_totals, country_reconciliation, on="dest_country", how="left").fillna(0.0)
