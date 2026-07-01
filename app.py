@@ -244,7 +244,3 @@ if st.sidebar.button("Run Cost Allocation Matrix", type="primary"):
                 
             except Exception as e:
                 st.error(f"Execution Error: {str(e)}")
-                )
-                
-            except Exception as e:
-                st.error(f"Execution Error: {str(e)}")
