@@ -24,7 +24,6 @@ CARRIER_REGISTRY = {
         "constants": {},
         "numeric_format": "german"  # Handles comma-to-dot replacement
     }
-    # Future carriers (UPS, PostAT, MSD) can be added here with their specific field maps
 }
 
 CHARGE_CATEGORY_RULES = {
@@ -55,7 +54,7 @@ def categorize_charge_description(desc):
     return "freight"
 
 def normalize_invoice(carrier_code, uploaded_files):
-    """Ingests raw carrier files and maps them to the canonical schema."""
+    """Ingests raw carrier files (Excel or CSV) and maps them to the canonical schema."""
     config = CARRIER_REGISTRY[carrier_code]
     f_map = config["field_map"]
     consts = config["constants"]
@@ -64,14 +63,23 @@ def normalize_invoice(carrier_code, uploaded_files):
     
     for uploaded_file in uploaded_files:
         header_setting = 0 if config["has_header"] else None
-        # Read the file from memory
-        df_raw = pd.read_csv(
-            uploaded_file, 
-            header=header_setting, 
-            encoding=config["encoding"], 
-            delimiter=config["delimiter"],
-            dtype=str
-        )
+        
+        # DYNAMIC EXTENSION DETECTION
+        # Read with the appropriate engine based on file type
+        if uploaded_file.name.endswith(('.xlsx', '.xls')):
+            df_raw = pd.read_excel(
+                uploaded_file,
+                header=header_setting,
+                dtype=str
+            )
+        else:
+            df_raw = pd.read_csv(
+                uploaded_file, 
+                header=header_setting, 
+                encoding=config["encoding"], 
+                delimiter=config["delimiter"],
+                dtype=str
+            )
         
         df_canonical = pd.DataFrame()
         
@@ -102,10 +110,10 @@ def normalize_invoice(carrier_code, uploaded_files):
 
 def run_allocation_engine(canonical_df, df_bq):
     """Splits carrier country totals across target channels using BQ parcel shares."""
-    # Exclude tax rows from all allocation steps per Rule 2
+    # Exclude tax rows from all allocation steps
     work_df = canonical_df[canonical_df["charge_category"] != "tax"].copy()
     
-    # 1. Core aggregation
+    # Core aggregation
     invoice_geo = work_df.groupby(["carrier", "dest_country", "alloc_month"])["amount_net"].sum().reset_index()
     df_bq_parcels = df_bq[df_bq["ship_type"] == "parcel"].copy()
     
@@ -158,10 +166,10 @@ st.markdown("Automated logistics pipeline for transforming raw invoices into nor
 st.sidebar.header("Data Ingestion Panel")
 selected_carrier = st.sidebar.selectbox("Select Target Carrier Pipeline", list(CARRIER_REGISTRY.keys()))
 
-# File Upload Interfaces
+# Updated file uploader to support both CSV and XLSX extensions
 uploaded_invoices = st.sidebar.file_uploader(
-    f"Upload raw {selected_carrier} Invoice CSV(s)", 
-    type=["csv"], 
+    f"Upload raw {selected_carrier} Invoice (Excel or CSV)", 
+    type=["csv", "xlsx"], 
     accept_multiple_files=True
 )
 uploaded_bq = st.sidebar.file_uploader("Upload BigQuery Parcel Extract CSV", type=["csv"])
@@ -179,13 +187,11 @@ if st.sidebar.button("Run Cost Allocation Matrix", type="primary"):
                 # Step 3 & 4: Run allocation calculations
                 df_allocated = run_allocation_engine(df_canonical, df_bq_raw)
                 
-                # --------------------------------------------------------------
-                # PIPELINE AUDIT COMPLIANCE: CHECK 1 METRICS
-                # --------------------------------------------------------------
+                # Pipeline Audit Compliance Checks
                 pre_split_total = df_canonical[df_canonical["charge_category"] != "tax"]["amount_net"].sum()
                 post_split_total = df_allocated["amount_channel"].sum() if not df_allocated.empty else 0.0
                 
-                # Check line aggregation to country total verification
+                # Check line aggregation verification
                 country_reconciliation = df_allocated.groupby("dest_country")["amount_channel"].sum().reset_index()
                 invoice_geo_totals = df_canonical[df_canonical["charge_category"] != "tax"].groupby("dest_country")["amount_net"].sum().reset_index()
                 merged_check = pd.merge(invoice_geo_totals, country_reconciliation, on="dest_country", how="left").fillna(0.0)
@@ -234,6 +240,10 @@ if st.sidebar.button("Run Cost Allocation Matrix", type="primary"):
                     data=excel_buffer,
                     file_name=f"{selected_carrier}_Channel_Allocation_Matrix.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                
+            except Exception as e:
+                st.error(f"Execution Error: {str(e)}")
                 )
                 
             except Exception as e:
